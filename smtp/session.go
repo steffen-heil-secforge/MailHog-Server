@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/ian-kent/linkio"
+	"github.com/mailhog/MailHog-Server/config"
 	"github.com/mailhog/MailHog-Server/monkey"
 	"github.com/mailhog/data"
 	"github.com/mailhog/smtp"
@@ -24,6 +25,7 @@ type Session struct {
 	isTLS         bool
 	line          string
 	link          *linkio.Link
+	blacklist     map[string]bool
 
 	reader io.Reader
 	writer io.Writer
@@ -31,16 +33,16 @@ type Session struct {
 }
 
 // Accept starts a new SMTP session using io.ReadWriteCloser
-func Accept(remoteAddress string, conn io.ReadWriteCloser, storage storage.Storage, messageChan chan *data.Message, hostname string, monkey monkey.ChaosMonkey) {
+func Accept(remoteAddress string, conn io.ReadWriteCloser, cfg *config.Config) {
 	defer conn.Close()
 
 	proto := smtp.NewProtocol()
-	proto.Hostname = hostname
+	proto.Hostname = cfg.Hostname
 	var link *linkio.Link
 	reader := io.Reader(conn)
 	writer := io.Writer(conn)
-	if monkey != nil {
-		linkSpeed := monkey.LinkSpeed()
+	if cfg.Monkey != nil {
+		linkSpeed := cfg.Monkey.LinkSpeed()
 		if linkSpeed != nil {
 			link = linkio.NewLink(*linkSpeed * linkio.BytePerSecond)
 			reader = link.NewLinkReader(io.Reader(conn))
@@ -48,7 +50,7 @@ func Accept(remoteAddress string, conn io.ReadWriteCloser, storage storage.Stora
 		}
 	}
 
-	session := &Session{conn, proto, storage, messageChan, remoteAddress, false, "", link, reader, writer, monkey}
+	session := &Session{conn, proto, cfg.Storage, cfg.MessageChan, remoteAddress, false, "", link, cfg.Blacklist, reader, writer, cfg.Monkey}
 	proto.LogHandler = session.logf
 	proto.MessageReceivedHandler = session.acceptMessage
 	proto.ValidateSenderHandler = session.validateSender
@@ -59,7 +61,7 @@ func Accept(remoteAddress string, conn io.ReadWriteCloser, storage storage.Stora
 	session.logf("Starting session")
 	session.Write(proto.Start())
 	for session.Read() == true {
-		if monkey != nil && monkey.Disconnect != nil && monkey.Disconnect() {
+		if cfg.Monkey != nil && cfg.Monkey.Disconnect != nil && cfg.Monkey.Disconnect() {
 			session.conn.Close()
 			break
 		}
@@ -79,6 +81,10 @@ func (c *Session) validateAuthentication(mechanism string, args ...string) (erro
 }
 
 func (c *Session) validateRecipient(to string) bool {
+	if c.blacklist != nil && c.blacklist[to] {
+		c.logf("Rejecting email to blacklisted address: %s", to)
+		return false
+	}
 	if c.monkey != nil {
 		ok := c.monkey.ValidRCPT(to)
 		if !ok {
@@ -89,6 +95,10 @@ func (c *Session) validateRecipient(to string) bool {
 }
 
 func (c *Session) validateSender(from string) bool {
+	if c.blacklist != nil && c.blacklist[from] {
+		c.logf("Rejecting email from blacklisted address: %s", from)
+		return false
+	}
 	if c.monkey != nil {
 		ok := c.monkey.ValidMAIL(from)
 		if !ok {
